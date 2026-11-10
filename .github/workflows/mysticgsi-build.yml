@@ -1,5 +1,7 @@
 name: MysticGSI - Build
 
+run-name: "Build ${{ inputs.request_id }}"
+
 # Build a GSI from a publicly reachable stock firmware archive.  The build is
 # intentionally manual: firmware archives are large and are not suitable for
 # storing in the repository or passing as workflow artifacts.
@@ -30,12 +32,17 @@ on:
         required: true
         default: false
         type: boolean
+      request_id:
+        description: "Bot request id (used by the bot to find this run)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: mysticgsi-build-${{ github.ref }}
+  group: mysticgsi-build-${{ inputs.request_id || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -239,24 +246,39 @@ jobs:
           echo "BUILD_DATE=$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=mysticgsi-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
 
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/bin/python - <<'PY'
+          import glob, html, json, os, re
+
+          entry = json.load(open("tmp/gsilist.json"))[-1]
+          text = html.unescape(re.sub(r"<[^>]+>", "", entry["output"]))
+          head, _, info = text.partition("\n\nInfo: ")
+          notes = f"{head.strip()}\n\nFULL INFORMATION:\n{info.strip()}\n"
+          parts = sorted(glob.glob("release/*.part.0000"))
+          if parts:
+              name = os.path.basename(parts[0])[: -len(".part.0000")]
+              notes += (
+                  "\nThe ZIP is split into parts because GitHub limits files to 2 GB. "
+                  "Download all parts into one folder and join them.\n\n"
+                  f"Windows (cmd):\n```\ncopy /b {name}.part.* {name}\n```\n\n"
+                  f"Linux / macOS:\n```\ncat {name}.part.* > {name}\n```\n\n"
+                  "Check the result with `sha256sum -c SHA256SUMS.reassembled` "
+                  "(macOS: `shasum -a 256 -c SHA256SUMS.reassembled`).\n"
+              )
+          open("release_notes.md", "w").write(notes)
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"RELEASE_TITLE={entry['output_name']}\n")
+          PY
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
           fail_on_unmatched_files: true
-          name: MysticGSI ${{ inputs.build_name }} // ${{ env.BUILD_DATE }}
+          name: ${{ env.RELEASE_TITLE }}
           tag_name: ${{ env.RELEASE_TAG }}
           target_commitish: ${{ github.sha }}
-          body: |
-            ## MysticGSI GSI build
-
-            - Build name: `${{ inputs.build_name }}`
-            - ROM type: `${{ inputs.rom_type }}`
-            - Variant: `${{ inputs.variant_tag || 'default' }}`
-            - Source commit: [${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
-            - Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-
-            The release contains the ZIP archive either directly or as 1900
-            MiB `.part.*` files, together with `REASSEMBLE.md`, `output.txt`,
-            and SHA-256 manifests. `system.img` is kept as an intermediate
-            build product and is not uploaded.
+          body_path: release_notes.md
